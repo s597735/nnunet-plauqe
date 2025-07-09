@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-最终决战版 - DualBranchMSAFUNet (瓶颈层融合 + EMA)
-- 在网络的瓶颈层对两个分支的最高阶语义特征进行融合。
-- 在融合前，使用EMA模块对瓶颈特征进行增强。
-- 两个解码器都使用这个融合后的特征进行重建，实现真正的特征级信息共享。
-- 此设计在保证稳定性的前提下，极大地提升了模型的性能潜力。
+最终决战版 V2 - DualBranchMSAFUNet (渐进式融合 + 跨注意力)
+- 包含两个独立的编码器和两个独立的解码器。
+- 在解码器的每个尺度上，通过一个跨注意力模块进行特征对齐和融合。
+- 实现了真正的、渐进式的、贯穿解码全程的特征交互。
 """
 from typing import Union, Type, List, Tuple
 import torch
@@ -13,25 +12,39 @@ from torch import nn
 from dynamic_network_architectures.architectures.unet import PlainConvUNet
 from dynamic_network_architectures.initialization.weight_init import InitWeights_He
 
-class EMAModule(nn.Module):
-    """ 高效多尺度注意力模块 (EMA) """
+# [!! 最终关键修复 !!] 使用池化来降低计算量的轻量化跨注意力模块
+class LightweightCrossAttentionFusion(nn.Module):
     def __init__(self, in_channels: int, conv_op: Type[nn.Module]):
         super().__init__()
-        self.group_conv = conv_op(in_channels, in_channels, kernel_size=3,
-        stride=1, padding=1, groups=in_channels, bias=False)
-        self.cross_spatial = nn.Sequential(
-            conv_op(in_channels, in_channels, kernel_size=1, bias=False),
-            conv_op(in_channels, in_channels, kernel_size=(1, 3), padding=(0, 1), bias=False),
-            conv_op(in_channels, in_channels, kernel_size=(3, 1), padding=(1, 0), bias=False),
-        )
-        self.sigmoid = nn.Sigmoid()
+        self.query_conv = conv_op(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = conv_op(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv = conv_op(in_channels, in_channels, kernel_size=1)
+        
+        # 使用平均池化来大幅缩小 key 和 value 的空间尺寸
+        self.pool = nn.AdaptiveAvgPool2d((32, 32)) # 将key/value固定池化到32x32
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        x_g = self.group_conv(x)
-        x_c = self.cross_spatial(x)
-        attention_map = self.sigmoid(x_g + x_c)
-        return identity * attention_map
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, query_feat: torch.Tensor, key_value_feat: torch.Tensor) -> torch.Tensor:
+        batch_size, C, height, width = query_feat.size()
+        
+        proj_query = self.query_conv(query_feat).view(batch_size, -1, width * height).permute(0, 2, 1)
+        
+        # 在计算 key 和 value 之前，先进行池化
+        pooled_kv_feat = self.pool(key_value_feat)
+        
+        proj_key = self.key_conv(pooled_kv_feat).view(batch_size, -1, 32 * 32)
+        proj_value = self.value_conv(pooled_kv_feat).view(batch_size, -1, 32 * 32)
+
+        energy = torch.bmm(proj_query, proj_key)
+        attention = self.softmax(energy)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, height, width)
+
+        out = self.gamma * out + query_feat
+        return out
+
 
 class DualBranchMSAFUNet(nn.Module):
     def __init__(self,
@@ -54,7 +67,6 @@ class DualBranchMSAFUNet(nn.Module):
                  deep_supervision: bool = False):
         super().__init__()
         
-        # 强制关闭两个内部网络的深度监督，确保行为绝对一致和稳定
         branch_kwargs = {
             'input_channels': input_channels, 'n_stages': n_stages, 'features_per_stage': features_per_stage,
             'conv_op': conv_op, 'kernel_sizes': kernel_sizes, 'strides': strides,
@@ -65,66 +77,68 @@ class DualBranchMSAFUNet(nn.Module):
             'deep_supervision': False
         }
         
-        self.net_long_axis = PlainConvUNet(**branch_kwargs)
-        self.net_short_axis = PlainConvUNet(**branch_kwargs)
+        # [!! 核心修改 1 !!] 我们不再实例化完整的U-Net，而是分别实例化编码器和解码器
+        self.encoder_long = PlainConvUNet(**branch_kwargs).encoder
+        self.encoder_short = PlainConvUNet(**branch_kwargs).encoder
         
-        # [!! 新增 1 !!] 瓶颈层的EMA注意力模块
-        bottleneck_features = features_per_stage[-1]
-        self.ema_long = EMAModule(bottleneck_features, conv_op)
-        self.ema_short = EMAModule(bottleneck_features, conv_op)
+        self.decoder_long = PlainConvUNet(**branch_kwargs).decoder
+        self.decoder_short = PlainConvUNet(**branch_kwargs).decoder
 
-        # [!! 新增 2 !!] 瓶颈层的特征融合卷积层
-        self.bottleneck_fusion_conv = conv_op(bottleneck_features * 2, bottleneck_features, 
-        kernel_size=1, stride=1, padding=0, bias=True)
+        # [!! 核心修改 2 !!] 为解码器的每一层创建跨注意力融合模块
+        self.fusion_modules_long_to_short = nn.ModuleList()
+        self.fusion_modules_short_to_long = nn.ModuleList()
+        # 解码器上采样后的特征通道数
+        decoder_features = features_per_stage[::-1][1:] 
+        for f in decoder_features:
+            self.fusion_modules_long_to_short.append(LightweightCrossAttentionFusion(f, conv_op))
+            self.fusion_modules_short_to_long.append(LightweightCrossAttentionFusion(f, conv_op))
 
         # 后期融合层依然保留
-        self.fusion_conv = conv_op(num_classes * 2, num_classes, 
-        kernel_size=1, stride=1, padding=0, bias=True)
-        self.decoder = self.net_long_axis.decoder
+        self.fusion_conv = conv_op(num_classes * 2, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
         self.apply(InitWeights_He(1e-2))
 
-    def forward(self, x_long: torch.Tensor, x_short: torch.Tensor = None) -> torch.Tensor:
-        if x_short is None:
-            x_short = x_long
+    def forward(self, x_long: torch.Tensor, x_short: torch.Tensor = None, return_independent_outputs: bool = False):
+        if x_short is None: x_short = x_long
         
-        # 1. 两个分支的编码器独立运行，得到各自的跳跃连接和瓶颈特征
-        skips_long = self.net_long_axis.encoder(x_long)
-        skips_short = self.net_short_axis.encoder(x_short)
+        # 1. 独立编码
+        skips_long = self.encoder_long(x_long)
+        skips_short = self.encoder_short(x_short)
         
-        bottleneck_long = skips_long[-1]
-        bottleneck_short = skips_short[-1]
-
-        # 2. 对瓶颈特征应用EMA模块进行增强
-        ema_bottleneck_long = self.ema_long(bottleneck_long)
-        ema_bottleneck_short = self.ema_short(bottleneck_short)
-
-        # 3. 在瓶颈层进行特征融合
-        concatenated_bottleneck = torch.cat((ema_bottleneck_long, ema_bottleneck_short), dim=1)
-        fused_bottleneck = self.bottleneck_fusion_conv(concatenated_bottleneck)
-
-        # 4. [!! 核心修正 !!]
-        #    以 nnU-Net Decoder 期望的正确方式，将“原始跳跃连接”和“新的融合瓶颈”一同传入
-        #    Decoder期望的输入是一个列表: [skip1, skip2, ..., skip_n, bottleneck]
+        # 2. [!! 核心修改 3 !!] 渐进式跨注意力融合解码
+        # 我们需要手动模拟解码器的上采样和融合过程
         
-        # 提取两个分支原始的、不包含瓶颈层的跳跃连接
-        original_skips_long = skips_long[:-1]
-        original_skips_short = skips_short[:-1]
+        # 初始化解码器的输入（来自bottleneck）
+        x_dec_long = skips_long[-1]
+        x_dec_short = skips_short[-1]
 
-        # 将原始跳跃连接和新的融合瓶颈层重新打包成解码器需要的格式
-        decoder_input_long = original_skips_long + [fused_bottleneck]
-        decoder_input_short = original_skips_short + [fused_bottleneck]
+        for i in range(len(self.decoder_long.stages)):
+            # a. 上采样
+            x_dec_long = self.decoder_long.transpconvs[i](x_dec_long)
+            x_dec_short = self.decoder_short.transpconvs[i](x_dec_short)
 
-        # [!! 核心修正 !!]
-        # 删除了错误的 "self.net_..._decoder.encoder.skips = ..." 注入方式
-        # 使用正确的参数调用解码器
-        logits_long = self.net_long_axis.decoder(decoder_input_long)
-        logits_short = self.net_short_axis.decoder(decoder_input_short)
+            # b. 跨注意力融合
+            # 将长轴的上采样特征与短轴的跳跃连接进行注意力融合
+            fused_for_short = self.fusion_modules_long_to_short[i](x_dec_short, skips_long[-(i + 2)])
+            # 将短轴的上采样特征与长轴的跳跃连接进行注意力融合
+            fused_for_long = self.fusion_modules_short_to_long[i](x_dec_long, skips_short[-(i + 2)])
+            
+            # c. 与各自的跳跃连接拼接
+            x_dec_long = torch.cat((x_dec_long, fused_for_long), dim=1)
+            x_dec_short = torch.cat((x_dec_short, fused_for_short), dim=1)
+            
+            # d. 通过解码器卷积块
+            x_dec_long = self.decoder_long.stages[i](x_dec_long)
+            x_dec_short = self.decoder_short.stages[i](x_dec_short)
+
+        # 3. 最终输出和后期融合
+        logits_long = self.decoder_long.seg_layers[0](x_dec_long)
+        logits_short = self.decoder_short.seg_layers[0](x_dec_short)
         
-        # 5. 对两个更优的预测结果，进行最终的后期融合
         concatenated_logits = torch.cat((logits_long, logits_short), dim=1)
         final_output = self.fusion_conv(concatenated_logits)
 
-        return final_output
-
-    def compute_conv_feature_map_size(self, input_size: Tuple[int, ...]) -> int:
-        return self.net_long_axis.compute_conv_feature_map_size(input_size)
+        # 根据参数决定返回格式
+        if return_independent_outputs:
+            return final_output, logits_long, logits_short
+        else:
+            return final_output
